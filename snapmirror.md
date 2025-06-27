@@ -732,3 +732,176 @@ Cluster2::> snapmirror initialize -destination-path svmdr-noid:
 ```
 
 Nach einiger Zeit ist die Übertragung der Baseline abgeschlossen. Der vserver kann gestartet werden und CIFS-Shares können für einen Readonly-Zugriff bereits eingerichtet werden.
+
+### SVM DR Destination schreibbar machen
+
+Snapmirror-Beziehung quiescen und amit den Schedule aussetzen:
+```bash
+Cluster2::> snapmirror quiesce -destination-path
+    c2_svm1:            c2_svm1:<volume>    svmdr-dest:
+    svmdr-dest:<volume>
+
+Cluster2::> snapmirror show
+                                                                       Progress
+Source            Destination Mirror  Relationship   Total             Last
+Path        Type  Path        State   Status         Progress  Healthy Updated
+----------- ---- ------------ ------- -------------- --------- ------- --------
+c1_svm1:c1_svm1_vol1
+            XDP  c2_svm1:c1_svm1_vol1_allsnap_dest
+                              Broken-off
+                                      Idle           -         false   -
+c1_svm2:    XDP  svmdr-dest:  Snapmirrored
+                                      Quiesced       -         true    -
+2 entries were displayed.
+```
+
+Mit Snapmnirror Break dieReplikation brechen und die Destinations Volumes und SVMs schreibbar machen:
+```bash
+Cluster2::> snapmirror break -destination-path svmdr-dest:
+
+Notice: Volume quota and efficiency operations will be queued after "SnapMirror break"
+        operation is complete. To check the status, run "job show -description "Vserverdr
+        Break Callback job for Vserver : svmdr-dest"".
+
+Cluster2::> snapmirror show
+                                                                       Progress
+Source            Destination Mirror  Relationship   Total             Last
+Path        Type  Path        State   Status         Progress  Healthy Updated
+----------- ---- ------------ ------- -------------- --------- ------- --------
+c1_svm2:    XDP  svmdr-dest:  Broken-off
+                                      Idle           -         true    -
+```
+
+Die SVM ist vom Subtype nun "default",  bleibt aber "stopped". Die Interfaces bleiben daher auch "down":
+```bash
+Cluster2::> vserver show -vserver svmdr*
+                               Admin      Operational Root
+Vserver     Type    Subtype    State      State       Volume     Aggregate
+----------- ------- ---------- ---------- ----------- ---------- ----------
+Cluster2    admin   -          -          -           -          -
+Cluster2-01 node    -          -          -           -          -
+Cluster2-02 node    -          -          -           -          -
+svmdr-dest  data    default    running    stopped     c1_svm2_   cluster2_
+                                                      root       02_FC1
+4 entries were displayed.
+
+Cluster2::> net int show -vserver svmdr-dest
+  (network interface show)
+            Logical    Status     Network            Current       Current Is
+Vserver     Interface  Admin/Oper Address/Mask       Node          Port    Home
+----------- ---------- ---------- ------------------ ------------- ------- ----
+svmdr-dest
+            c1_svm2_nas_lif1
+                         up/down  192.168.0.61/24    Cluster2-02   e0e     true
+```
+
+Auf der ehemaligen Source sollte nun sicher gestellt werden, dass die SVM offline ist, und die Interfaces undVolumes nicht mehr erreichbar sind:
+```bash
+Cluster1::> vserver stop -vserver c1_svm2
+[Job 103] Job succeeded: DONE
+
+Cluster1::> cifs share show -vserver c1_svm2                                                 Cluster1::> vserver show
+    show            show-aggregates show-protocols
+Cluster1::> vserver show
+                               Admin      Operational Root
+Vserver     Type    Subtype    State      State       Volume     Aggregate
+----------- ------- ---------- ---------- ----------- ---------- ----------
+Cluster1    admin   -          -          -           -          -
+Cluster1-01 node    -          -          -           -          -
+Cluster1-02 node    -          -          -           -          -
+c1_svm2     data    default    stopped    stopped     c1_svm2_   n2_hdd_1
+                                                      root
+4 entries were displayed.
+```
+
+
+Jetzt kann die SVM auf der Destination gestartet werden:
+```bash
+Cluster2::> vserver start -vserver svmdr-dest
+[Job 109] Job succeeded: DONE
+
+Cluster2::> net int show -vserver svmdr-dest
+  (network interface show)
+            Logical    Status     Network            Current       Current Is
+Vserver     Interface  Admin/Oper Address/Mask       Node          Port    Home
+----------- ---------- ---------- ------------------ ------------- ------- ----
+svmdr-dest
+            c1_svm2_nas_lif1
+                         up/up    192.168.0.61/24    Cluster2-02   e0e     true
+```
+
+### SVM DR Resync (Reverse Resync)
+In den folgenden Schritten wird die ehemalige Source nun zum Ziel der Snapmirror Synchronisation.
+
+Mit `snapmirror list-destinations`kann überprüft werden, von welches Destinationen Snapmirror-Beziehungen ausgehen:
+```bash
+Cluster1::> snapmirror list-destinations
+                                                  Progress
+Source             Destination         Transfer   Last         Relationship
+Path         Type  Path         Status Progress   Updated      Id
+----------- ----- ------------ ------- --------- ------------ ---------------
+c1_svm2:    XDP   svmdr-dest:  Idle    -         -            73a109ad-529a-11f0-b4ee-005056990301
+```
+
+Snapmirror-Beziehung anlegen. Die ehemalige Quelle ist nun das Ziel. Sie erscheint als "Broken-off":
+```bash
+Cluster1::> snapmirror create -source-path svmdr-dest: -destination-path c1_svm2: -vserver c1_svm2 -throttle unlimited -type XDP -schedule 5min -policy MirrorAllSnapshots -identity-preserve true
+
+
+Cluster1::> snapmirror show
+                                                                       Progress
+Source            Destination Mirror  Relationship   Total             Last
+Path        Type  Path        State   Status         Progress  Healthy Updated
+----------- ---- ------------ ------- -------------- --------- ------- --------
+svmdr-dest: XDP  c1_svm2:     Broken-off Idle        -         true    -
+2 entries were displayed.
+```
+
+Mit `snapmirror resync` kan nun das Delta von der neuen Quelle synchronisiert werden:
+```bash
+Cluster1::> snapmirror resync -destination-path c1_svm2: -source-path svmdr-dest:                                                                                                         Warning: All data newer than Snapshot copy
+         "vserverdr.0.c2be3bfb-5299-11f0-b4ee-005056990301.2025-06-27_071000" on Vserver
+         "c1_svm2" will be deleted.
+Do you want to continue? {y|n}: y
+
+Cluster1::> snapmirror show
+                                                                       Progress
+Source            Destination Mirror  Relationship   Total             Last
+Path        Type  Path        State   Status         Progress  Healthy Updated
+----------- ---- ------------ ------- -------------- --------- ------- --------
+svmdr-dest: XDP  c1_svm2:     Broken-off Transferring -        true    -
+```
+
+
+Nach einiger Zeit erscheint die Beziehung als `idle` und Healthy als`true`:
+```bash
+Cluster1::> snapmirror show
+                                                                       Progress
+Source            Destination Mirror  Relationship   Total             Last
+Path        Type  Path        State   Status         Progress  Healthy Updated
+----------- ---- ------------ ------- -------------- --------- ------- --------
+c2_svm1:c1_svm1_vol1_allsnap_dest XDP c1_svm1:c1_svm1_vol1 Snapmirrored Idle - true -
+svmdr-dest: XDP  c1_svm2:     Snapmirrored Idle      -         true    -
+2 entries were displayed.
+```
+
+Die SVM ist nun `dp-destination` und weiterhin `stopped`
+```bash
+Cluster1::> vserver show
+                               Admin      Operational Root
+Vserver     Type    Subtype    State      State       Volume     Aggregate
+----------- ------- ---------- ---------- ----------- ---------- ----------
+Cluster1    admin   -          -          -           -          -
+Cluster1-01 node    -          -          -           -          -
+Cluster1-02 node    -          -          -           -          -
+c1_svm1     data    default    running    running     c1_svm1_   n1_hdd_1
+                                                      root
+c1_svm2     data    dp-destination        stopped     c1_svm2_   n2_hdd_1
+                               stopped                root
+c1_svm3     data    default    running    running     c1_svm3_   n1_hdd_2
+                                                      root
+6 entries were displayed.
+
+
+
+
